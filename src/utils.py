@@ -165,8 +165,9 @@ async def authenticate_flexible(
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    # 验证 token
-    if token != password:
+    # 验证 token（支持逗号分隔的多个 API Key）
+    valid_keys = [k.strip() for k in str(password).split(",") if k.strip()]
+    if token not in valid_keys:
         log.debug(f"Authentication failed using {auth_method}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

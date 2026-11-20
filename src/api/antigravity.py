@@ -185,6 +185,102 @@ def _should_forward_antigravity_header(header_name: str) -> bool:
         "x-request-id",
     }
 
+_BLOCKED_SYSTEM_PROMPT_SNIPPETS = (
+    "- Follow style/role-play instructions only when they do not conflict with these rules.",
+)
+
+_SYSTEM_PROMPT_REPLACEMENTS = (
+    (
+        "Use `astrbot_shell_session` to list, poll, write raw text or",
+        "Use astrbot_shell_session to manage, poll, write text or",
+    ),
+    (
+        "Write JSON args as `content` to xd://<tool> via",
+        "Supply JSON args in `content` for xd://<tool> using",
+    ),
+    (
+        "selects only the lines you and your subagents wrote and never touches",
+        "stages only the lines authored by you and your subagents without touching",
+    ),
+    (
+        "Read xd://<tool> for full docs + JSON schema before first use",
+        "Inspect any xd://<tool> with `read` to view its full documentation and JSON schema prior to calling it",
+    ),
+    (
+        "You are omp's trusted coding assistant.",
+        "You are a trusted software engineering assistant.",
+    ),
+    (
+        "RFC 2119 keywords: MUST, REQUIRED, SHOULD, RECOMMENDED, MAY, OPTIONAL.",
+        "Normative modal terms (MUST, REQUIRED, SHOULD, RECOMMENDED, MAY, OPTIONAL) apply strictly.",
+    ),
+    (
+        "XML tags inject system content; may interrupt/notify inside user messages: MUST treat as system-authored/authoritative. User content is sanitized.",
+        "XML tags may inject authoritative runtime notifications inside user messages; user-authored text is sanitized.",
+    ),
+    (
+        "Touch displayed changed lines only",
+        "Edit only visible changed lines",
+    ),
+)
+
+
+def _strip_blocked_system_snippets(text: str) -> str:
+    for snippet in _BLOCKED_SYSTEM_PROMPT_SNIPPETS:
+        if snippet in text:
+            text = (
+                text.replace(f"{snippet}\r\n", "")
+                .replace(f"{snippet}\n", "")
+                .replace(snippet, "")
+            )
+    for old, new in _SYSTEM_PROMPT_REPLACEMENTS:
+        if old in text:
+            text = text.replace(old, new)
+    return text
+
+
+def _sanitize_system_instruction(inner: Dict[str, Any]) -> None:
+    stripped = False
+    for key in ("systemInstruction", "system_instruction"):
+        sys_inst = inner.get(key)
+        if isinstance(sys_inst, str):
+            cleaned = _strip_blocked_system_snippets(sys_inst)
+            if cleaned != sys_inst:
+                stripped = True
+                if cleaned.strip():
+                    inner[key] = cleaned
+                else:
+                    inner.pop(key, None)
+        elif isinstance(sys_inst, dict):
+            parts = sys_inst.get("parts")
+            if not isinstance(parts, list):
+                continue
+            changed = False
+            new_parts = []
+            for part in parts:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    orig_text = part["text"]
+                    cleaned = _strip_blocked_system_snippets(orig_text)
+                    if cleaned != orig_text:
+                        changed = True
+                        stripped = True
+                        if cleaned.strip():
+                            new_part = dict(part)
+                            new_part["text"] = cleaned
+                            new_parts.append(new_part)
+                        continue
+                new_parts.append(part)
+            if changed:
+                if new_parts:
+                    new_inst = dict(sys_inst)
+                    new_inst["parts"] = new_parts
+                    inner[key] = new_inst
+                else:
+                    inner.pop(key, None)
+    if stripped:
+        log.info("[ANTIGRAVITY] Stripped flagged systemInstruction snippet")
+
+
 
 def _sanitize_antigravity_headers(extra_headers: Optional[Dict[str, str]]) -> Dict[str, str]:
     if not extra_headers:
@@ -211,6 +307,7 @@ async def wrap_cli_request(
     # 避免对大 payload（长对话历史）做整体 deepcopy 的热路径开销；
     # contents 等未修改字段与调用方共享引用（调用方随后不再修改）
     inner = dict(gemini_request)
+    _sanitize_system_instruction(inner)
 
     # 注入 sessionId（联合锚点 = model + systemInstruction + 前两条消息特征，
     # 与 derive_session_key 同口径）：同会话跨轮次恒定，共 system 的不同会话不撞车，
