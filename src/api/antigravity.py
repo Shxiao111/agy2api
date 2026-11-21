@@ -163,6 +163,127 @@ def _contents_have_tool_interactions(contents: Any) -> bool:
     return False
 
 
+def _iter_gemini_parts(payload: Any):
+    """遍历 Gemini JSON 响应（含 response 包装）中的所有 candidate parts。"""
+    if not isinstance(payload, dict):
+        return
+    inner = payload.get("response") if isinstance(payload.get("response"), dict) else payload
+    candidates = inner.get("candidates")
+    if not isinstance(candidates, list):
+        return
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        content = candidate.get("content")
+        if not isinstance(content, dict):
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if isinstance(part, dict):
+                yield part
+
+
+def _part_has_meaningful_content(part: Dict[str, Any]) -> bool:
+    """判断单个 Gemini part 是否携带实际输出内容（排除空壳/占位符）。"""
+    if part.get("functionCall") or part.get("function_call"):
+        return True
+    if part.get("inlineData") or part.get("inline_data"):
+        return True
+    if part.get("executableCode") or part.get("codeExecutionResult"):
+        return True
+    if "text" in part:
+        text = part.get("text")
+        if isinstance(text, str) and text:
+            # 跳过 skip_thought_signature_validator 占位符，但普通空白（如空格/换行）
+            # 在流中段可能作为 token 出现，首块纯空串 "" 不算有效内容
+            if part.get("thoughtSignature") == "skip_thought_signature_validator" and text.strip() in ("...", "…"):
+                return False
+            return True
+    return False
+
+
+def _chunk_has_meaningful_content(chunk: Any) -> bool:
+    """判断非 native 的 SSE 行是否包含实际输出内容。"""
+    if not isinstance(chunk, str):
+        return bool(chunk)
+    stripped = chunk.strip()
+    if not stripped or not stripped.startswith("data: "):
+        return False
+    payload_str = stripped[6:].strip()
+    if not payload_str or payload_str == "[DONE]":
+        return False
+    try:
+        data = json.loads(payload_str)
+    except Exception:
+        return False
+    return any(_part_has_meaningful_content(part) for part in _iter_gemini_parts(data))
+
+
+def _summarize_empty_stream_chunks(chunks: List[str], limit: int = 800) -> str:
+    """提取空流首/尾块中的关键调试字段（finishReason / promptFeedback / usageMetadata）。"""
+    samples: List[str] = []
+    for raw in chunks:
+        if not isinstance(raw, str):
+            continue
+        s = raw.strip()
+        if not s.startswith("data: "):
+            continue
+        body = s[6:].strip()
+        if not body or body == "[DONE]":
+            continue
+        samples.append(body)
+    if not samples:
+        return f"no data chunks (raw_count={len(chunks)})"
+    if len(samples) <= 2:
+        joined = " | ".join(samples)
+    else:
+        joined = f"{samples[0]} | ... ({len(samples) - 2} omitted) ... | {samples[-1]}"
+    return joined[:limit]
+
+
+def _refresh_payload_request_ids(
+    final_payload: Dict[str, Any],
+    *,
+    rotate_session: bool = False,
+) -> None:
+    """刷新请求体中的 requestId（可选轮换 sessionId/trajectory_id 以绕过失效上游 KV 缓存）。"""
+    inner = final_payload.get("request")
+    if not isinstance(inner, dict):
+        return
+
+    labels = inner.get("labels")
+    if not isinstance(labels, dict):
+        labels = {}
+
+    if rotate_session:
+        new_session_id = f"-{uuid.uuid4().int % 9_000_000_000_000_000_000}"
+        new_trajectory_id = str(uuid.uuid4())
+        inner["sessionId"] = new_session_id
+        labels["trajectory_id"] = new_trajectory_id
+    else:
+        new_session_id = str(inner.get("sessionId") or "")
+        new_trajectory_id = str(labels.get("trajectory_id") or "")
+
+    step = 1
+    try:
+        step = max(1, int(labels.get("last_step_index") or 1))
+    except (TypeError, ValueError):
+        step = 1
+
+    new_request_id = _generate_request_id(new_session_id, step, new_trajectory_id)
+    final_payload["requestId"] = new_request_id
+    if not new_trajectory_id:
+        parts = new_request_id.split("/")
+        if len(parts) >= 4:
+            new_trajectory_id = parts[3]
+            labels["trajectory_id"] = new_trajectory_id
+    labels["request_id"] = f"{new_trajectory_id}-{step}"
+    inner["labels"] = labels
+
+
+_EMPTY_STREAM_MAX_RETRIES = 2
 def _should_forward_antigravity_header(header_name: str) -> bool:
     """判断是否向 Antigravity 上游透传该请求头。
 
@@ -612,7 +733,7 @@ async def stream_request(
     retry_config = await get_retry_config()
     max_retries = retry_config["max_retries"]
     retry_interval = retry_config["retry_interval"]
-
+    effective_max_retries = max(max_retries, _EMPTY_STREAM_MAX_RETRIES)
     DISABLE_ERROR_CODES = await get_auto_ban_error_codes()  # 禁用凭证的错误码
     last_error_response = None  # 记录最后一次的错误响应
     last_error_body = ""  # 详细日志：最后一次的错误响应体
@@ -662,12 +783,15 @@ async def stream_request(
         final_payload["project"] = project_id
         return True
 
-    for attempt in range(max_retries + 1):
+    empty_retries_used = 0
+    for attempt in range(effective_max_retries + 1):
         success_recorded = False  # 标记是否已记录成功
         need_retry = False  # 标记是否需要重试
+        retry_was_empty = False  # 标记本次失败是否为空内容流
         usage_tokens: Dict[str, int] = {}  # 从流中提取的 token 用量
+        pending_chunks: List[Any] = []  # 缓冲首个有效内容前的空壳/控制 SSE 块
+        raw_empty_chunks: List[str] = []  # 记录空内容流中的 raw data 行用于诊断
         attempt_start_time = time.time()  # 本次上游调用开始时间
-
         async def _log_stream_result(status_code: int, success: bool, error_message: str = "") -> None:
             """
             写入一次上游调用的请求日志（调用一次谷歌 API 产生一条日志；
@@ -737,6 +861,7 @@ async def stream_request(
                                 log.info(
                                     f"[ANTIGRAVITY STREAM] 404 已切换至新凭证 {current_file} 重试 (attempt {attempt + 2}/{max_retries + 1})"
                                 )
+                                _refresh_payload_request_ids(final_payload, rotate_session=False)
                                 continue
                         log.error(f"[ANTIGRAVITY STREAM] 无其他支持模型 {model_name} 的凭证，返回 404")
                         yield chunk
@@ -792,13 +917,6 @@ async def stream_request(
                         yield chunk
                         return
                 else:
-                    # 不是Response，说明是真流，直接yield返回
-                    # 只在第一个chunk时记录成功
-                    if not success_recorded:
-                        await record_api_call_success(current_file, model_name=model_name)
-                        success_recorded = True
-                        log.debug(f"[ANTIGRAVITY STREAM] 开始接收流式响应，模型: {model_name}")
-
                     # 从流块中提取 token 用量（热路径优化）：
                     # usageMetadata 几乎只出现在流尾块。先用低开销的子串探测，
                     # 命中才做完整 JSON 解析，避免对每个 chunk 两次 json.loads
@@ -806,6 +924,22 @@ async def stream_request(
                         extracted = extract_usage_tokens(chunk)
                         if extracted:
                             usage_tokens = extracted
+
+                    if not success_recorded:
+                        if native is False:
+                            if not _chunk_has_meaningful_content(chunk):
+                                if isinstance(chunk, str) and chunk.strip():
+                                    raw_empty_chunks.append(chunk)
+                                    pending_chunks.append(chunk)
+                                continue
+
+                        await record_api_call_success(current_file, model_name=model_name)
+                        success_recorded = True
+                        log.debug(f"[ANTIGRAVITY STREAM] 开始接收流式响应，模型: {model_name}")
+                        if pending_chunks:
+                            for buffered in pending_chunks:
+                                yield buffered
+                            pending_chunks.clear()
 
                     yield chunk
 
@@ -815,32 +949,67 @@ async def stream_request(
                 await _log_stream_result(200, True)
                 return
             elif not need_retry:
-                # 没有收到任何数据（空回复），需要重试
-                log.warning(f"[ANTIGRAVITY STREAM] 收到空回复，无任何内容，凭证: {current_file}")
-                await record_api_call_error(current_file, 200, None, model_name=model_name,
-                    error_message="Empty response from API"
+                # 上游仅返回空行/空 candidates/仅有 usageMetadata 的空壳流，无任何实际输出
+                empty_summary = _summarize_empty_stream_chunks(raw_empty_chunks)
+                last_error_body = empty_summary
+                log.warning(
+                    f"[ANTIGRAVITY STREAM] 收到空回复，无任何实际内容，凭证: {current_file}, 详情: {empty_summary}"
+                )
+                await record_api_call_error(
+                    current_file,
+                    200,
+                    None,
+                    model_name=model_name,
+                    error_message=f"Empty response from API: {empty_summary[:250]}",
                 )
                 # 本次上游调用（空回复）产生一条日志
-                await _log_stream_result(200, False, "Empty response from API")
+                await _log_stream_result(200, False, f"Empty response from API: {empty_summary[:250]}")
 
-                if attempt < max_retries:
+                if empty_retries_used < _EMPTY_STREAM_MAX_RETRIES and attempt < effective_max_retries:
+                    empty_retries_used += 1
                     need_retry = True
+                    retry_was_empty = True
+                elif last_error_response:
+                    log.error(f"[ANTIGRAVITY STREAM] 空回复达到最大重试次数 ({empty_retries_used})，返回前次上游错误")
+                    yield last_error_response
+                    return
                 else:
-                    log.error(f"[ANTIGRAVITY STREAM] 空回复达到最大重试次数")
+                    log.error(f"[ANTIGRAVITY STREAM] 空回复达到最大重试次数 ({empty_retries_used})")
                     yield Response(
-                        content=json.dumps({"error": "服务返回空回复"}),
-                        status_code=500,
-                        media_type="application/json"
+                        content=json.dumps({
+                            "error": {
+                                "message": "Upstream returned an empty response after retries",
+                                "type": "upstream_empty_response",
+                                "code": 502,
+                            }
+                        }),
+                        status_code=502,
+                        media_type="application/json",
                     )
                     return
-            
+
             # 统一处理重试
             if need_retry:
-                log.info(f"[ANTIGRAVITY STREAM] 重试请求 (attempt {attempt + 2}/{max_retries + 1})...")
+                if not retry_was_empty and attempt >= max_retries:
+                    log.error("[ANTIGRAVITY STREAM] 达到最大重试次数，返回原始错误")
+                    if last_error_response:
+                        yield last_error_response
+                    else:
+                        yield Response(
+                            content=json.dumps({"error": "请求失败，所有重试均已耗尽"}),
+                            status_code=502,
+                            media_type="application/json",
+                        )
+                    return
+
+                log.info(
+                    f"[ANTIGRAVITY STREAM] 重试请求 (attempt {attempt + 2}/{effective_max_retries + 1}, "
+                    f"empty_retry={retry_was_empty})..."
+                )
 
                 switched, next_cred_task = await _switch_credential_for_retry(
                     next_cred_task=next_cred_task,
-                    retry_interval=retry_interval,
+                    retry_interval=0.2 if retry_was_empty else retry_interval,
                     refresh_credential_fast=refresh_credential_fast,
                     apply_cred_result=apply_cred_result,
                     log_prefix="[ANTIGRAVITY STREAM]",
@@ -854,8 +1023,12 @@ async def stream_request(
                         media_type="application/json"
                     )
                     return
+                # 刷新 requestId；空响应二次及以上重试额外轮换 sessionId/trajectory_id，绕过失效上游 KV 缓存
+                _refresh_payload_request_ids(
+                    final_payload,
+                    rotate_session=retry_was_empty and empty_retries_used >= 2,
+                )
                 continue  # 重试
-
         except GeneratorExit:
             # 下游提前关闭了本生成器（转换器断流、抗截断续传、客户端断开等）。
             # 已收到上游数据却未走到正常收尾时，补记一条成功日志，避免请求
@@ -872,6 +1045,7 @@ async def stream_request(
                 # 本次上游调用（异常）产生一条日志
                 await _log_stream_result(500, False, f"异常: {e}")
                 await asyncio.sleep(retry_interval)
+                _refresh_payload_request_ids(final_payload, rotate_session=False)
                 continue
             else:
                 # 所有重试都失败，返回最后一次的错误（如果有）
@@ -1010,7 +1184,7 @@ async def non_stream_request(
     retry_config = await get_retry_config()
     max_retries = retry_config["max_retries"]
     retry_interval = retry_config["retry_interval"]
-
+    effective_max_retries = max(max_retries, _EMPTY_STREAM_MAX_RETRIES)
     DISABLE_ERROR_CODES = await get_auto_ban_error_codes()  # 禁用凭证的错误码
     last_error_response = None  # 记录最后一次的错误响应
     next_cred_task = None  # 预热的下一个凭证任务
@@ -1058,10 +1232,11 @@ async def non_stream_request(
         final_payload["project"] = project_id
         return True
 
-    for attempt in range(max_retries + 1):
+    empty_retries_used = 0
+    for attempt in range(effective_max_retries + 1):
         need_retry = False  # 标记是否需要重试
+        retry_was_empty = False  # 标记本次失败是否为空响应
         attempt_start_time = time.time()  # 本次上游调用开始时间
-        
         try:
             response = await post_async(
                 url=target_url,
@@ -1073,24 +1248,38 @@ async def non_stream_request(
 
             # 成功
             if status_code == 200:
-                # 检查是否为空回复
+                # 检查是否为空回复（包括空字节与无任何候选输出内容的 JSON 空壳）
+                empty_reason = ""
                 if not response.content or len(response.content) == 0:
-                    log.warning(f"[ANTIGRAVITY] 收到200响应但内容为空，凭证: {current_file}")
+                    empty_reason = "Empty response from API"
+                else:
+                    try:
+                        parsed_resp = json.loads(response.content.decode("utf-8"))
+                        if not any(_part_has_meaningful_content(part) for part in _iter_gemini_parts(parsed_resp)):
+                            empty_reason = f"Empty response from API: {response.content.decode('utf-8', errors='ignore')[:250]}"
+                    except Exception:
+                        pass
+
+                if empty_reason:
+                    log.warning(f"[ANTIGRAVITY] 收到200响应但无有效内容，凭证: {current_file}, 详情: {empty_reason}")
+                    last_error_body = empty_reason
                     
                     # 记录错误
                     await record_api_call_error(current_file, 200, None, model_name=model_name,
-                        error_message="Empty response from API"
+                        error_message=empty_reason[:500]
                     )
                     # 本次上游调用（空回复）产生一条日志
-                    await _log_result(200, False, error_message="Empty response from API")
+                    await _log_result(200, False, error_message=empty_reason[:500])
                     
-                    if attempt < max_retries:
+                    if empty_retries_used < _EMPTY_STREAM_MAX_RETRIES and attempt < effective_max_retries:
+                        empty_retries_used += 1
                         need_retry = True
+                        retry_was_empty = True
                     else:
-                        log.error(f"[ANTIGRAVITY] 空回复达到最大重试次数")
+                        log.error(f"[ANTIGRAVITY] 空回复达到最大重试次数 ({empty_retries_used})")
                         return Response(
-                            content=json.dumps({"error": "服务返回空回复"}),
-                            status_code=500,
+                            content=json.dumps({"error": {"message": "Upstream returned an empty response after retries", "type": "upstream_empty_response", "code": 502}}),
+                            status_code=502,
                             media_type="application/json"
                         )
                 else:
@@ -1140,6 +1329,7 @@ async def non_stream_request(
                             log.info(
                                 f"[ANTIGRAVITY] 404 已切换至新凭证 {current_file} 重试 (attempt {attempt + 2}/{max_retries + 1})"
                             )
+                            _refresh_payload_request_ids(final_payload, rotate_session=False)
                             continue
                     log.error(f"[ANTIGRAVITY] 无其他支持模型 {model_name} 的凭证，返回 404")
                     return last_error_response
@@ -1192,11 +1382,21 @@ async def non_stream_request(
             
             # 统一处理重试
             if need_retry:
-                log.info(f"[ANTIGRAVITY] 重试请求 (attempt {attempt + 2}/{max_retries + 1})...")
+                if not retry_was_empty and attempt >= max_retries:
+                    log.error("[ANTIGRAVITY] 达到最大重试次数，返回原始错误")
+                    return last_error_response or Response(
+                        content=json.dumps({"error": "所有重试均失败"}),
+                        status_code=502,
+                        media_type="application/json"
+                    )
+                log.info(
+                    f"[ANTIGRAVITY] 重试请求 (attempt {attempt + 2}/{effective_max_retries + 1}, "
+                    f"empty_retry={retry_was_empty})..."
+                )
 
                 switched, next_cred_task = await _switch_credential_for_retry(
                     next_cred_task=next_cred_task,
-                    retry_interval=retry_interval,
+                    retry_interval=0.2 if retry_was_empty else retry_interval,
                     refresh_credential_fast=refresh_credential_fast,
                     apply_cred_result=apply_cred_result,
                     log_prefix="[ANTIGRAVITY]",
@@ -1209,6 +1409,10 @@ async def non_stream_request(
                         status_code=500,
                         media_type="application/json"
                     )
+                _refresh_payload_request_ids(
+                    final_payload,
+                    rotate_session=retry_was_empty and empty_retries_used >= 2,
+                )
                 continue  # 重试
 
         except Exception as e:
@@ -1218,6 +1422,7 @@ async def non_stream_request(
                 # 本次上游调用（异常）产生一条日志
                 await _log_result(500, False, error_message=f"异常: {e}")
                 await asyncio.sleep(retry_interval)
+                _refresh_payload_request_ids(final_payload, rotate_session=False)
                 continue
             else:
                 # 所有重试都失败，返回最后一次的错误（如果有）或500错误
